@@ -1,13 +1,16 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from databricks import sql
 
+# Load .env from backend/.env (3 levels up from backend/src/data) or current directory
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 load_dotenv()
 
 def get_connection():
     hostname = os.getenv("DATABRICKS_SERVER_HOSTNAME")
-    http_path = os.getenv("DATABRICKSHTTP_PATH")
+    http_path = os.getenv("DATABRICKS_HTTP_PATH")
     token = os.getenv("DATABRICKS_TOKEN")
 
     if not hostname:
