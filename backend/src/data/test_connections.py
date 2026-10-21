@@ -1,4 +1,4 @@
-from backend.src.data.databricks_client import get_connection
+from src.data.databricks_client import get_connection
 
 def test_connection():
     connection = get_connection()
