@@ -1,0 +1,33 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+databricks-sql-connector
+databricks-sdk
+openai
+pyarrow
+python-multipart
+
+# Data processing
+numpy
+pandas
+pyarrow
+
+# Machine learning and model persistence
+scikit-learn
+xgboost
+joblib
+
+# Statistical modeling and forecasting
+statsmodels
+prophet
+cmdstanpy
+
+# Deep learning
+tensorflow
+
+# Databricks integration
+databricks-sql-connector
+databricks-sdk
+
+# OpenAI integration
+openai
