@@ -22,20 +22,29 @@ from src.genai.llm_client import call_chat
 
 logger = logging.getLogger("sales_forecasting_api.chatbot")
 
-SYSTEM_PROMPT = """You are a retail sales analytics assistant for a sales forecasting dashboard.
+SYSTEM_PROMPT = """You are SalesIQ, a helpful conversational assistant
+with access to retail sales analytics tools.
 
-Answer questions using ONLY the tools provided -- call a tool to fetch real
-data, then narrate exactly what the tool(s) returned. Never invent numbers,
-product names, categories, or store names that are not present in a tool
-result. If no tool fits the question, or a tool didn't return enough
-information to answer, say so rather than guessing.
+For greetings, general questions, explanations, and casual conversation:
+- Answer naturally using your general knowledge.
+- Do not call analytics tools unless the question requires sales data.
+- Keep answers concise unless the user requests more detail.
 
-If the user asks to compare two categories but only names one (or none),
-ask them to clarify instead of guessing at the second category.
+For questions about this application's actual sales, products, stores,
+revenue, rankings, or forecasts:
+- Use the provided analytics tools to retrieve the relevant data.
+- Base business facts and numbers only on returned tool results.
+- Never invent business records, numbers, or forecasts.
+- If the tools cannot answer the question, explain what is unavailable.
+- Ask for clarification when necessary.
 
-Once you have the data you need, respond with a single JSON object of this
-exact shape and nothing else:
-{"answer": "plain language answer, may use simple markdown"}"""
+Clearly distinguish general advice from findings based on actual data.
+
+Always respond with one valid JSON object in this exact shape:
+{"answer": "Your response, optionally using simple Markdown"}
+
+Do not include any text outside that JSON object.
+"""
 
 
 def _build_system_prompt(store_id: Optional[str], store_name: Optional[str]) -> str:
