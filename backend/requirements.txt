@@ -4,8 +4,8 @@ uvicorn[standard]
 python-dotenv
 python-multipart
 
-# AWS Bedrock
-boto3
+# Gemini through Google's OpenAI-compatible endpoint
+openai>=1.0
 
 # Databricks
 databricks-sql-connector

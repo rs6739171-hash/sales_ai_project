@@ -296,10 +296,10 @@ def explain_forecast(request: ExplainRequest) -> ExplainResponse:
     try:
         narrative = generate_explanation(context, request.user_question)
     except LLMConfigError as exc:
-        logger.error("Amazon Bedrock is not configured: %s", exc)
+        logger.error("Gemini is not configured: %s", exc)
         raise HTTPException(status_code=503, detail=f"GenAI explanation service is not configured: {exc}")
     except Exception:
-        logger.exception("Amazon Bedrock call failed")
+        logger.exception("Gemini call failed")
         raise HTTPException(
             status_code=503,
             detail="GenAI explanation service is currently unreachable. Please try again shortly.",
@@ -383,7 +383,7 @@ def chat(request: ChatRequest) -> ChatResponse:
             store_name=request.store_name,
         )
     except LLMConfigError as exc:
-        logger.error("Azure OpenAI is not configured: %s", exc)
+        logger.error("Gemini is not configured: %s", exc)
         raise HTTPException(status_code=503, detail=f"Chat service is not configured: {exc}")
     except Exception:
         logger.exception("Chat request failed")

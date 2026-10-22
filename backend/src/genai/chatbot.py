@@ -234,28 +234,43 @@ def _fallback_answer(tool_results: dict[str, Any]) -> str:
 
 
 def _execute_tool_calls(tool_calls) -> dict[str, Any]:
-    """Run each tool the model requested, returning {tool_name: result}."""
-
+    """Execute analytics tools, keeping each result under its unique call ID."""
     results: dict[str, Any] = {}
     for call in tool_calls:
         name = call.function.name
         try:
             args = json.loads(call.function.arguments or "{}")
-        except json.JSONDecodeError:
-            args = {}
+            if not isinstance(args, dict):
+                raise ValueError("Tool arguments must be an object.")
+        except (json.JSONDecodeError, TypeError, ValueError):
+            results[call.id] = {"error": f"Invalid arguments for {name}."}
+            continue
 
         handler = TOOL_DISPATCH.get(name)
         if handler is None:
-            results[name] = {"error": f"Unknown tool: {name}"}
+            results[call.id] = {"error": f"Unknown tool: {name}"}
             continue
-
         try:
-            results[name] = handler(args)
+            results[call.id] = handler(args)
         except Exception:
-            logger.exception("Analytics function %s failed for args=%s", name, args)
-            results[name] = {"error": f"{name} failed to run."}
-
+            logger.exception("Analytics function %s failed", name)
+            results[call.id] = {"error": f"{name} failed to run."}
     return results
+
+
+def _summarize_tool_results(tool_calls, results_by_id) -> dict[str, Any]:
+    """Preserve the API's function-name keys without dropping repeated calls.
+
+    One call keeps its existing result shape. Multiple calls to the same
+    function become a list, for example when comparing two different stores.
+    """
+    grouped: dict[str, list[Any]] = {}
+    for call in tool_calls:
+        grouped.setdefault(call.function.name, []).append(results_by_id[call.id])
+    return {
+        name: values[0] if len(values) == 1 else values
+        for name, values in grouped.items()
+    }
 
 
 def run_chat(
@@ -264,22 +279,15 @@ def run_chat(
     store_id: Optional[str] = None,
     store_name: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Answer a free-text question via LLM tool-calling.
+    """Answer a business question using analytics tools and Gemini.
 
-    store_id/store_name, when given (the dashboard's currently-selected
-    store), are added to the system prompt as context so store-scoped tools
-    apply that filter by default -- without this, get_top_category/
-    get_top_product always answer globally regardless of what's selected.
-
-    Returns {"answer": str, "data": dict, "functions_used": list[str]}.
-    Never raises for a malformed final answer -- falls back to a templated
-    one built from the actual tool results instead. Network/credential
-    failures from the LLM call itself DO propagate, so the caller can turn
-    them into a clean 503 (same contract as
-    forecast_explainer.generate_explanation).
+    Returns the existing answer/data/functions_used API shape. Tool selection
+    and final JSON generation are separate requests. Provider failures propagate
+    to FastAPI; malformed final JSON falls back to the actual tool results.
     """
-
-    messages: list[dict[str, Any]] = [{"role": "system", "content": _build_system_prompt(store_id, store_name)}]
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": _build_system_prompt(store_id, store_name)}
+    ]
     for turn in history or []:
         if turn.get("role") in ("user", "assistant") and turn.get("content"):
             messages.append({"role": turn["role"], "content": turn["content"]})
@@ -287,37 +295,61 @@ def run_chat(
 
     assistant_message = call_chat(messages, tools=TOOLS)
     tool_results: dict[str, Any] = {}
-
     if assistant_message.tool_calls:
+        # Keep the complete SDK message, including Gemini provider metadata.
+        # Rebuilding only name/arguments would discard thought signatures.
         messages.append(assistant_message.model_dump(exclude_none=True))
-        tool_results = _execute_tool_calls(assistant_message.tool_calls)
+        results_by_id = _execute_tool_calls(assistant_message.tool_calls)
+        tool_results = _summarize_tool_results(
+            assistant_message.tool_calls, results_by_id
+        )
         for call in assistant_message.tool_calls:
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": json.dumps(tool_results.get(call.function.name, {}), default=str),
-                }
-            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json.dumps(results_by_id[call.id], default=str),
+            })
+    else:
+        answer = _parse_answer(assistant_message.content)
+        if answer is not None:
+            return {"answer": answer, "data": {}, "functions_used": []}
+        messages.append(assistant_message.model_dump(exclude_none=True))
+        messages.append({
+            "role": "user",
+            "content": 'Return your response as one JSON object: {"answer": "..."}.',
+        })
 
     for attempt in range(2):
-        final_message = call_chat(
-    messages,
-    tools=TOOLS,
-    json_mode=True,
-)
+        # No tools in the final JSON request: execution is already complete.
+        final_message = call_chat(messages, json_mode=True)
+        if final_message.tool_calls:
+            logger.warning("Unexpected tool request during final answer generation")
+            break
         answer = _parse_answer(final_message.content)
         if answer is not None:
             if tool_results:
                 _check_numeric_grounding(answer, tool_results)
-            return {"answer": answer, "data": tool_results, "functions_used": list(tool_results.keys())}
-        logger.warning("Chat final answer failed validation on attempt %d: %r", attempt + 1, final_message.content)
+            return {
+                "answer": answer,
+                "data": tool_results,
+                "functions_used": list(tool_results),
+            }
+        logger.warning("Chat final answer failed validation on attempt %d", attempt + 1)
+        if attempt == 0:
+            messages.append(final_message.model_dump(exclude_none=True))
+            messages.append({
+                "role": "user",
+                "content": (
+                    'Your previous reply was not valid JSON with a string "answer". '
+                    'Return only {"answer": "..."}, using only the supplied data.'
+                ),
+            })
 
-    logger.warning("Chat final answer failed validation twice; falling back to templated answer.")
+    logger.warning("Chat final answer failed validation; using factual fallback")
     return {
         "answer": _fallback_answer(tool_results),
         "data": tool_results,
-        "functions_used": list(tool_results.keys()),
+        "functions_used": list(tool_results),
     }
 
 
