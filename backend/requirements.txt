@@ -4,10 +4,17 @@ uvicorn[standard]
 python-dotenv
 python-multipart
 
-# Gemini through Google's OpenAI-compatible endpoint
+# Response data classes retained for the existing chatbot interface
 openai>=1.0
 
 # Databricks
 databricks-sql-connector
 databricks-sdk
 pyarrow
+
+# Local Ollama inference through LangChain
+langchain-ollama>=1.1.0,<2
+langchain-core>=1.6.13,<2
+ollama>=0.6.3,<1
+httpx>=0.28.1,<1
+pydantic>=2.7,<3

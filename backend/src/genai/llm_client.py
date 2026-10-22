@@ -1,61 +1,277 @@
-"""Gemini Developer API client for forecast explanations and analytics chat.
+"""Local Ollama through LangChain, shared by forecast explanations and chat.
 
-Uses Google's OpenAI-compatible endpoint. The OpenAI package is only the
-client library; requests and credentials go to Google, not to OpenAI.
+Uses the native Ollama API, with thinking disabled and a modest context window
+for a 16 GB RAM / 4 GB VRAM development laptop. No LLM API key is required.
 """
 
 import json
+import logging
 import os
+import random
+import time
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
+import httpx
 from dotenv import load_dotenv
-from openai import AuthenticationError, OpenAI
+from langchain_core.exceptions import OutputParserException
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage, convert_to_messages
+from langchain_ollama import ChatOllama
+from ollama import ResponseError
 from openai.types.chat import ChatCompletionMessage
+from pydantic import ValidationError
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+logger = logging.getLogger("sales_forecasting_api.llm")
 
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+# JSON mode alone permits any object. These schemas constrain the actual
+# decoder to the exact response fields used by each existing application flow.
+GREETING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"message": {"type": "string"}},
+    "required": ["message"],
+    "additionalProperties": False,
+}
+CHAT_ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+FORECAST_EXPLANATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "explanation": {"type": "string"},
+        "key_drivers": {"type": "array", "items": {"type": "string"}},
+        "risks_or_opportunities": {"type": "array", "items": {"type": "string"}},
+        "recommendation": {"type": "string"},
+    },
+    "required": ["explanation", "key_drivers", "risks_or_opportunities", "recommendation"],
+    "additionalProperties": False,
+}
 
 
 class LLMConfigError(RuntimeError):
-    """Missing or invalid Gemini configuration or API credentials."""
+    """Missing model, invalid endpoint or invalid local configuration."""
 
 
-class LLMResponseError(RuntimeError):
-    """Gemini returned an incomplete, blocked, or empty response."""
+class LLMServiceError(RuntimeError):
+    """Safe diagnostic that the API may return to its caller."""
+
+    def __init__(self, message: str, status_code: int = 503):
+        super().__init__(message)
+        self.status_code = status_code
 
 
-def _settings() -> tuple[str, str, int]:
-    """Validate configuration and return only non-secret settings."""
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
-    if not key or key in {"your_gemini_api_key", "paste_your_key_here"}:
-        raise LLMConfigError("Set GEMINI_API_KEY in backend/.env.")
-    if not model:
-        raise LLMConfigError("Set GEMINI_MODEL to a model available to your project.")
+class LLMResponseError(LLMServiceError):
+    """Incomplete, malformed or empty model output."""
+
+    def __init__(self, message: str):
+        super().__init__(message, status_code=502)
+
+
+class _LocalChatOllama(ChatOllama):
+    """Preserve native tool_name with langchain-ollama 1.1.0 / ollama 0.6.3.
+
+    LangChain tracks calls by ID internally, while this Ollama SDK serializes
+    native tool results using tool_name and order. The upstream adapter omits
+    tool_name, so add it before the SDK serializes each message.
+    """
+
+    def _convert_messages_to_ollama_messages(self, messages: list[BaseMessage]) -> list[dict]:
+        converted = super()._convert_messages_to_ollama_messages(messages)
+        names_by_id = {
+            call["id"]: call["name"]
+            for message in messages if isinstance(message, AIMessage)
+            for call in message.tool_calls
+        }
+        for source, target in zip(messages, converted, strict=True):
+            if isinstance(source, ToolMessage):
+                name = source.name or names_by_id.get(source.tool_call_id)
+                if name:
+                    target["tool_name"] = name
+        return converted
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    base_url: str
+    model: str
+    num_ctx: int
+    num_predict: int
+    timeout: int
+    max_retries: int
+
+
+def _settings() -> LLMSettings:
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip().rstrip("/")
     try:
-        max_tokens = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
-        if max_tokens <= 0:
-            raise ValueError
-    except ValueError as exc:
+        parsed = urlsplit(base_url)
+        valid = (
+            parsed.scheme in {"http", "https"} and parsed.hostname
+            and not parsed.username and not parsed.password
+            and not parsed.query and not parsed.fragment and not parsed.path
+        )
+        _ = parsed.port
+    except ValueError:
+        valid = False
+    if not valid:
         raise LLMConfigError(
-            "GEMINI_MAX_OUTPUT_TOKENS must be a positive integer."
-        ) from exc
-    return GEMINI_BASE_URL, model, max_tokens
+            "OLLAMA_BASE_URL must be an HTTP(S) server URL, for example http://127.0.0.1:11434."
+        )
+    model = os.getenv("OLLAMA_MODEL", "qwen3:4b").strip()
+    if not model:
+        raise LLMConfigError("Set OLLAMA_MODEL to the exact model tag shown by ollama list.")
+    values = []
+    for name, default, minimum, maximum in (
+        ("OLLAMA_NUM_CTX", "4096", 2048, 32768),
+        ("OLLAMA_NUM_PREDICT", "1024", 64, 8192),
+        ("OLLAMA_TIMEOUT_SECONDS", "180", 5, 600),
+        ("OLLAMA_MAX_RETRIES", "0", 0, 2),
+    ):
+        try:
+            value = int(os.getenv(name, default))
+            if not minimum <= value <= maximum:
+                raise ValueError
+        except ValueError as exc:
+            raise LLMConfigError(
+                f"{name} must be an integer between {minimum} and {maximum}."
+            ) from exc
+        values.append(value)
+    if values[1] >= values[0]:
+        raise LLMConfigError("OLLAMA_NUM_PREDICT must be smaller than OLLAMA_NUM_CTX.")
+    return LLMSettings(base_url, model, *values)
 
 
 @lru_cache(maxsize=1)
-def get_client() -> OpenAI:
-    _settings()
-    key = os.environ["GEMINI_API_KEY"].strip()
-    return OpenAI(
-        api_key=key,
-        base_url=GEMINI_BASE_URL,
-        timeout=45.0,
-        max_retries=1,
+def get_client() -> ChatOllama:
+    settings = _settings()
+    return _LocalChatOllama(
+        base_url=settings.base_url,
+        model=settings.model,
+        temperature=0,
+        reasoning=False,
+        num_ctx=settings.num_ctx,
+        num_predict=settings.num_predict,
+        keep_alive="5m",
+        client_kwargs={"timeout": httpx.Timeout(settings.timeout, connect=5.0)},
     )
+
+
+def _server_error(status: int) -> RuntimeError:
+    if status == 404:
+        return LLMConfigError(
+            "Ollama model or API path was not found. Check OLLAMA_BASE_URL and run "
+            "ollama pull with the exact OLLAMA_MODEL tag on the Ollama server."
+        )
+    if status in {401, 403}:
+        return LLMConfigError("Access to the configured Ollama endpoint was denied.")
+    if status in {400, 422}:
+        return LLMServiceError(
+            "Ollama rejected the model request. Check its server logs and confirm "
+            "the model supports tools and disabling thinking; qwen3:4b is the configured default.",
+            status_code=502,
+        )
+    if status == 429:
+        return LLMServiceError("The Ollama server is busy. Wait before retrying.", status_code=429)
+    return LLMServiceError(
+        "Ollama could not complete the request. Check its server logs for "
+        "model-loading, memory or runtime errors."
+    )
+
+
+def _call_chat_native(
+    messages: list[BaseMessage | dict[str, Any]],
+    tools: Optional[list[dict[str, Any]]] = None,
+    json_mode: bool = False,
+    response_schema: Optional[dict[str, Any]] = None,
+) -> AIMessage:
+    """Return native LangChain tool calls or a final text/JSON response.
+
+    Run tool selection and final JSON narration separately. No API key or
+    external provider is needed when OLLAMA_BASE_URL points to your local server.
+    """
+    settings = _settings()
+    if not messages:
+        raise ValueError("messages must not be empty.")
+    if tools and json_mode:
+        raise ValueError("Use separate requests for tool selection and final JSON.")
+    if response_schema is not None and not json_mode:
+        raise ValueError("response_schema requires json_mode=True.")
+    # Legacy assistant tool-call dumps may omit content when it is None.
+    normalized = [
+        {**message, "content": message.get("content") or ""}
+        if isinstance(message, dict) else message
+        for message in messages
+    ]
+    request_messages = convert_to_messages(normalized)
+    model = get_client()
+    runnable = model.bind_tools(tools) if tools else model
+    # Return complete responses to FastAPI; do not expose reasoning or partial JSON.
+    runnable = runnable.bind(stream=False)
+    if json_mode:
+        instruction = (
+            "Return only the requested JSON object. Use the exact field names and "
+            "types from the response schema. Do not add wrapper objects or markdown. "
+            "Use supplied context as evidence when present."
+        )
+        if response_schema is not None:
+            instruction += "\nResponse JSON schema: " + json.dumps(response_schema)
+        if isinstance(request_messages[0], SystemMessage):
+            original = request_messages[0]
+            request_messages[0] = SystemMessage(content=f"{original.content}\n\n{instruction}")
+        else:
+            request_messages.insert(0, SystemMessage(content=instruction))
+        runnable = runnable.bind(format=response_schema if response_schema is not None else "json")
+
+    for attempt in range(settings.max_retries + 1):
+        try:
+            response = runnable.invoke(request_messages)
+            break
+        except ResponseError as exc:
+            status = exc.status_code or 500
+            transient = status in {408, 429} or 500 <= status < 600
+            if not transient or attempt == settings.max_retries:
+                logger.error("Ollama request failed: server status %s", status)
+                raise _server_error(status) from exc
+        except httpx.TimeoutException as exc:
+            if attempt == settings.max_retries:
+                raise LLMServiceError(
+                    "Ollama generation timed out. Check model loading and GPU allocation "
+                    "with ollama ps; the first request can take longer."
+                ) from exc
+        except (ConnectionError, httpx.RequestError) as exc:
+            if attempt == settings.max_retries:
+                raise LLMServiceError(
+                    "Cannot connect to Ollama. Start the Ollama application and "
+                    "check OLLAMA_BASE_URL. The default port is 11434."
+                ) from exc
+        except OutputParserException as exc:
+            raise LLMResponseError("Ollama returned malformed tool arguments. Please retry.") from exc
+        except ValidationError as exc:
+            raise LLMResponseError("Ollama returned a malformed response or tool arguments. Please retry.") from exc
+        delay = 2 ** attempt + random.uniform(0, 0.5)
+        logger.warning("Retrying Ollama in %.1fs (%d/%d)", delay, attempt + 1, settings.max_retries)
+        time.sleep(delay)
+
+    if not isinstance(response, AIMessage):
+        raise LLMResponseError("Ollama returned an unexpected message type.")
+    if response.invalid_tool_calls:
+        raise LLMResponseError("Ollama returned malformed tool arguments. Please retry.")
+    reason = response.response_metadata.get("done_reason")
+    if reason not in {None, "stop", "tool_calls"}:
+        raise LLMResponseError(
+            f"Ollama response stopped before completion ({reason}). "
+            "For length errors, increase OLLAMA_NUM_PREDICT within the context budget."
+        )
+    if not response.text and not response.tool_calls:
+        raise LLMResponseError("Ollama returned no text or tool calls.")
+    return response
+
 
 
 def call_chat(
@@ -63,87 +279,66 @@ def call_chat(
     tools: Optional[list[dict[str, Any]]] = None,
     json_mode: bool = False,
 ) -> ChatCompletionMessage:
-    """Return the chat message interface used by the existing application.
+    """Preserve the response interface expected by the unchanged chatbot.
 
-    Tool selection and final JSON generation run in separate requests.
-    Keep complete assistant messages in tool history, including Gemini's
-    provider metadata and any thought signatures.
+    OpenAI is used only for its existing response data classes. Inference is
+    performed by ChatOllama through the native /api/chat endpoint; no OpenAI,
+    Azure, Gemini or Mistral API key or remote client is used.
     """
-    _, model, max_tokens = _settings()
-    if not messages:
-        raise ValueError("messages must not be empty.")
-    if json_mode and tools:
-        raise ValueError("Use separate requests for tool selection and final JSON.")
-
-    request_messages = list(messages)
-    request: dict[str, Any] = {
-        "model": model,
-        "messages": request_messages,
-        "max_completion_tokens": max_tokens,
-    }
-    if model.startswith("gemini-3"):
-        request["reasoning_effort"] = "low"
-    if tools:
-        request["tools"] = tools
-        request["tool_choice"] = "auto"
-    if json_mode:
-        request_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Return exactly one valid JSON object matching the requested "
-                    "shape. Return no markdown fences or text outside the JSON. "
-                    "Use only the supplied facts and tool results."
-                ),
-            },
-            *messages,
-        ]
-        request["messages"] = request_messages
-        request["response_format"] = {"type": "json_object"}
-
-    try:
-        response = get_client().chat.completions.create(**request)
-    except AuthenticationError as exc:
-        raise LLMConfigError(
-            "Gemini rejected the API key. Check GEMINI_API_KEY and its project."
-        ) from exc
-
-    if not response.choices:
-        raise LLMResponseError("Gemini returned no response choices.")
-    choice = response.choices[0]
-    if choice.finish_reason not in {"stop", "tool_calls"}:
-        raise LLMResponseError(
-            f"Gemini response stopped before completion: {choice.finish_reason}"
-        )
-    message = choice.message
-    if not message.content and not message.tool_calls:
-        raise LLMResponseError("Gemini returned no text or tool calls.")
-    return message
-
-
-def call_chat_json(system_prompt: str, user_message: str) -> str:
-    """Return JSON text; the existing forecast parser validates its schema."""
-    response = call_chat(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        json_mode=True,
+    response = _call_chat_native(
+        messages, tools=tools, json_mode=json_mode,
+        response_schema=CHAT_ANSWER_SCHEMA if json_mode else None,
     )
-    return response.content or ""
+    calls = [
+        {
+            "id": call["id"],
+            "type": "function",
+            "function": {
+                "name": call["name"],
+                "arguments": json.dumps(call["args"], ensure_ascii=False),
+            },
+        }
+        for call in response.tool_calls
+    ]
+    return ChatCompletionMessage(
+        role="assistant",
+        content=response.text,
+        tool_calls=calls or None,
+    )
+
+
+def call_chat_json(
+    system_prompt: str,
+    user_message: str,
+    *,
+    response_schema: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return forecast JSON by default; other callers may supply their schema.
+
+    The existing forecast explainer keeps its two-argument call unchanged.
+    The manual greeting test supplies GREETING_SCHEMA explicitly.
+    """
+    response = _call_chat_native(
+        [{"role": "system", "content": system_prompt},
+         {"role": "user", "content": user_message}],
+        json_mode=True,
+        response_schema=FORECAST_EXPLANATION_SCHEMA if response_schema is None else response_schema,
+    )
+    return response.text
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Test Gemini API connectivity.")
+    parser = argparse.ArgumentParser(description="Test local Ollama through LangChain.")
     parser.add_argument("--name", default="World")
     args = parser.parse_args()
     reply = call_chat_json(
         'Respond with JSON in this shape: {"message": "..."}.',
         f"Say hello to {args.name} in one short sentence.",
+        response_schema=GREETING_SCHEMA,
     )
     parsed = json.loads(reply)
     if not isinstance(parsed, dict) or not isinstance(parsed.get("message"), str):
-        raise LLMResponseError("Gemini did not return the expected greeting JSON.")
+        raise LLMResponseError("Ollama did not return the expected greeting JSON.")
     print(json.dumps(parsed, indent=2, ensure_ascii=False))

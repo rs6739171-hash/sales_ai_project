@@ -24,7 +24,7 @@ from src.data.db import (
 from src.genai.chatbot import QUICK_ACTIONS, run_chat, run_quick_action
 from src.genai.explain_context import build_forecast_context
 from src.genai.forecast_explainer import generate_explanation
-from src.genai.llm_client import LLMConfigError
+from src.genai.llm_client import LLMConfigError, LLMServiceError
 from src.models.schemas import (
     ChatRequest,
     ChatResponse,
@@ -296,10 +296,13 @@ def explain_forecast(request: ExplainRequest) -> ExplainResponse:
     try:
         narrative = generate_explanation(context, request.user_question)
     except LLMConfigError as exc:
-        logger.error("Gemini is not configured: %s", exc)
+        logger.error("Mistral is not configured: %s", exc)
         raise HTTPException(status_code=503, detail=f"GenAI explanation service is not configured: {exc}")
+    except LLMServiceError as exc:
+        logger.warning("Mistral explanation failed: %s", exc)
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except Exception:
-        logger.exception("Gemini call failed")
+        logger.exception("Mistral call failed")
         raise HTTPException(
             status_code=503,
             detail="GenAI explanation service is currently unreachable. Please try again shortly.",
@@ -383,8 +386,11 @@ def chat(request: ChatRequest) -> ChatResponse:
             store_name=request.store_name,
         )
     except LLMConfigError as exc:
-        logger.error("Gemini is not configured: %s", exc)
+        logger.error("Mistral is not configured: %s", exc)
         raise HTTPException(status_code=503, detail=f"Chat service is not configured: {exc}")
+    except LLMServiceError as exc:
+        logger.warning("Mistral chat failed: %s", exc)
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except Exception:
         logger.exception("Chat request failed")
         raise HTTPException(

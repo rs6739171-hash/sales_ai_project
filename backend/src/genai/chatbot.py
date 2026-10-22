@@ -15,6 +15,8 @@ import logging
 import re
 from typing import Any, Optional
 
+from langchain_core.messages import BaseMessage, ToolMessage
+
 from src.data import analytics
 from src.genai.llm_client import call_chat
 
@@ -237,24 +239,24 @@ def _execute_tool_calls(tool_calls) -> dict[str, Any]:
     """Execute analytics tools, keeping each result under its unique call ID."""
     results: dict[str, Any] = {}
     for call in tool_calls:
-        name = call.function.name
+        name = call["name"]
         try:
-            args = json.loads(call.function.arguments or "{}")
+            args = call["args"]
             if not isinstance(args, dict):
                 raise ValueError("Tool arguments must be an object.")
         except (json.JSONDecodeError, TypeError, ValueError):
-            results[call.id] = {"error": f"Invalid arguments for {name}."}
+            results[call["id"]] = {"error": f"Invalid arguments for {name}."}
             continue
 
         handler = TOOL_DISPATCH.get(name)
         if handler is None:
-            results[call.id] = {"error": f"Unknown tool: {name}"}
+            results[call["id"]] = {"error": f"Unknown tool: {name}"}
             continue
         try:
-            results[call.id] = handler(args)
+            results[call["id"]] = handler(args)
         except Exception:
             logger.exception("Analytics function %s failed", name)
-            results[call.id] = {"error": f"{name} failed to run."}
+            results[call["id"]] = {"error": f"{name} failed to run."}
     return results
 
 
@@ -266,7 +268,7 @@ def _summarize_tool_results(tool_calls, results_by_id) -> dict[str, Any]:
     """
     grouped: dict[str, list[Any]] = {}
     for call in tool_calls:
-        grouped.setdefault(call.function.name, []).append(results_by_id[call.id])
+        grouped.setdefault(call["name"], []).append(results_by_id[call["id"]])
     return {
         name: values[0] if len(values) == 1 else values
         for name, values in grouped.items()
@@ -279,13 +281,13 @@ def run_chat(
     store_id: Optional[str] = None,
     store_name: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Answer a business question using analytics tools and Gemini.
+    """Answer a business question using analytics tools and Mistral through LangChain.
 
     Returns the existing answer/data/functions_used API shape. Tool selection
     and final JSON generation are separate requests. Provider failures propagate
     to FastAPI; malformed final JSON falls back to the actual tool results.
     """
-    messages: list[dict[str, Any]] = [
+    messages: list[BaseMessage | dict[str, Any]] = [
         {"role": "system", "content": _build_system_prompt(store_id, store_name)}
     ]
     for turn in history or []:
@@ -296,24 +298,23 @@ def run_chat(
     assistant_message = call_chat(messages, tools=TOOLS)
     tool_results: dict[str, Any] = {}
     if assistant_message.tool_calls:
-        # Keep the complete SDK message, including Gemini provider metadata.
-        # Rebuilding only name/arguments would discard thought signatures.
-        messages.append(assistant_message.model_dump(exclude_none=True))
+        # Replay the native LangChain assistant message before tool results.
+        messages.append(assistant_message)
         results_by_id = _execute_tool_calls(assistant_message.tool_calls)
         tool_results = _summarize_tool_results(
             assistant_message.tool_calls, results_by_id
         )
         for call in assistant_message.tool_calls:
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,
-                "content": json.dumps(results_by_id[call.id], default=str),
-            })
+            messages.append(ToolMessage(
+                tool_call_id=call["id"],
+                name=call["name"],
+                content=json.dumps(results_by_id[call["id"]], default=str),
+            ))
     else:
-        answer = _parse_answer(assistant_message.content)
+        answer = _parse_answer(assistant_message.text)
         if answer is not None:
             return {"answer": answer, "data": {}, "functions_used": []}
-        messages.append(assistant_message.model_dump(exclude_none=True))
+        messages.append(assistant_message)
         messages.append({
             "role": "user",
             "content": 'Return your response as one JSON object: {"answer": "..."}.',
@@ -325,7 +326,7 @@ def run_chat(
         if final_message.tool_calls:
             logger.warning("Unexpected tool request during final answer generation")
             break
-        answer = _parse_answer(final_message.content)
+        answer = _parse_answer(final_message.text)
         if answer is not None:
             if tool_results:
                 _check_numeric_grounding(answer, tool_results)
@@ -336,7 +337,7 @@ def run_chat(
             }
         logger.warning("Chat final answer failed validation on attempt %d", attempt + 1)
         if attempt == 0:
-            messages.append(final_message.model_dump(exclude_none=True))
+            messages.append(final_message)
             messages.append({
                 "role": "user",
                 "content": (

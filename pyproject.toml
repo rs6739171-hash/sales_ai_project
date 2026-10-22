@@ -8,6 +8,11 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "langchain-ollama>=1.1.0,<2",
+    "langchain-core>=1.6.13,<2",
+    "ollama>=0.6.3,<1",
+    "httpx>=0.28.1,<1",
+    "pydantic>=2.7,<3",
     "openai>=1.0",
     "cmdstanpy>=1.3.0",
     "databricks-sdk>=0.154.0",
@@ -40,3 +45,4 @@ extraPaths = [
     "backend/src/data",
     "backend",
 ]
+
