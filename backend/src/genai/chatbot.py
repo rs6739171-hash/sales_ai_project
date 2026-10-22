@@ -18,7 +18,7 @@ from typing import Any, Optional
 from langchain_core.messages import BaseMessage, ToolMessage
 
 from src.data import analytics
-from src.genai.llm_client import call_chat
+from src.genai.llm_client import _call_chat_native as call_chat
 
 logger = logging.getLogger("sales_forecasting_api.chatbot")
 
