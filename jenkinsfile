@@ -1,0 +1,222 @@
+pipeline {
+    agent {
+        kubernetes {
+            cloud 'kind-sales-ai'
+            defaultContainer 'jnlp'
+            slaveConnectTimeout 300
+            showRawYaml false
+
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app.kubernetes.io/part-of: sales-ai
+    app.kubernetes.io/component: jenkins-agent
+spec:
+  serviceAccountName: jenkins-agent
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 30
+
+  nodeSelector:
+    salesiq.io/node-pool: applications
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+
+  containers:
+    - name: jnlp
+      image: jenkins/inbound-agent:3391.va_37fa_a_305d6d-6-alpine3.24-jdk21
+      imagePullPolicy: IfNotPresent
+      workingDir: /home/jenkins/agent
+
+      env:
+        - name: JAVA_TOOL_OPTIONS
+          value: "-Xms64m -Xmx256m"
+        - name: K8S_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "512Mi"
+
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+
+      volumeMounts:
+        - name: temporary-files
+          mountPath: /tmp
+
+    - name: nodejs
+      image: node:22.23.4-alpine3.24
+      imagePullPolicy: IfNotPresent
+      workingDir: /home/jenkins/agent
+
+      command:
+        - sleep
+      args:
+        - "7d"
+
+      env:
+        - name: CI
+          value: "true"
+        - name: NPM_CONFIG_CACHE
+          value: "/tmp/npm-cache"
+        - name: NODE_OPTIONS
+          value: "--max-old-space-size=768"
+        - name: VITE_API_BASE_URL
+          value: "/api"
+
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "256Mi"
+        limits:
+          cpu: "1000m"
+          memory: "1Gi"
+
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+
+      volumeMounts:
+        - name: temporary-files
+          mountPath: /tmp
+
+  volumes:
+    - name: temporary-files
+      emptyDir: {}
+'''
+        }
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 20, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Checkout source') {
+            steps {
+                script {
+                    def checkoutResult = checkout scm
+
+                    env.SOURCE_COMMIT = checkoutResult.GIT_COMMIT
+
+                    currentBuild.description =
+                        "main@${env.SOURCE_COMMIT.take(12)}"
+                }
+
+                sh '''
+                    set -eu
+
+                    echo "Agent Pod: $HOSTNAME"
+                    echo "Kubernetes node: $K8S_NODE_NAME"
+                    echo "Checked-out commit: $SOURCE_COMMIT"
+
+                    test -f backend/main.py
+                    test -f backend/requirements.txt
+                    test -f backend/dockerfile
+                    test -f frontend/package.json
+                    test -f frontend/package-lock.json
+                    test -f frontend/dockerfile
+                    test -f frontend/nginx.conf
+
+                    git rev-parse HEAD > source-commit.txt
+                    git ls-files > source-files.txt
+
+                    echo "PASS: Expected source files exist."
+                '''
+            }
+        }
+
+        stage('Install frontend dependencies') {
+            steps {
+                container('nodejs') {
+                    dir('frontend') {
+                        sh '''
+                            set -eu
+                            node --version
+                            npm --version
+                            npm ci
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Frontend tests') {
+            steps {
+                container('nodejs') {
+                    dir('frontend') {
+                        sh '''
+                            set -eu
+                            mkdir -p test-results
+                            npm run test -- --maxWorkers=1 --reporter=default --reporter=junit --outputFile.junit=test-results/vitest.xml
+                        '''
+                    }
+                }
+            }
+
+            post {
+                always {
+                    junit(
+                        testResults: 'frontend/test-results/vitest.xml',
+                        allowEmptyResults: false,
+                        skipPublishingChecks: true
+                    )
+                }
+            }
+        }
+
+        stage('Compile frontend') {
+            steps {
+                container('nodejs') {
+                    dir('frontend') {
+                        sh '''
+                            set -eu
+
+                            npm run build
+                            test -s dist/index.html
+
+                            tar -czf frontend-dist.tar.gz -C dist .
+                            sha256sum frontend-dist.tar.gz > frontend-dist.tar.gz.sha256
+
+                            echo "PASS: Frontend compiled and packaged."
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Archive build outputs') {
+            steps {
+                archiveArtifacts(
+                    artifacts: 'source-commit.txt,source-files.txt,frontend/frontend-dist.tar.gz,frontend/frontend-dist.tar.gz.sha256',
+                    fingerprint: true
+                )
+            }
+        }
+    }
+}
