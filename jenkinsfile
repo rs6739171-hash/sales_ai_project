@@ -196,13 +196,14 @@ spec:
 
     options {
         disableConcurrentBuilds()
-        timeout(time: 45, unit: 'MINUTES')
+        timeout(time: 60, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '10'))
         skipDefaultCheckout(true)
     }
 
     environment {
         BACKEND_IMAGE = 'ghcr.io/rs6739171-hash/sales-ai-backend'
+        FRONTEND_IMAGE = 'ghcr.io/rs6739171-hash/sales-ai-frontend'
         SOURCE_REPOSITORY = 'https://github.com/rs6739171-hash/sales_ai_project'
     }
 
@@ -467,6 +468,104 @@ PY
                 always {
                     archiveArtifacts(
                         artifacts: 'ci-reports/backend-image-metadata.json,ci-reports/backend-image.json',
+                        allowEmptyArchive: true,
+                        fingerprint: true
+                    )
+                }
+            }
+        }
+
+        stage('Build and publish frontend image') {
+            options {
+                timeout(time: 15, unit: 'MINUTES')
+            }
+            steps {
+                container('buildctl') {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'ghcr-publisher',
+                            usernameVariable: 'GHCR_USERNAME',
+                            passwordVariable: 'GHCR_TOKEN'
+                        )
+                    ]) {
+                        sh '''
+                            set +x
+                            set -eu
+                            umask 077
+
+                            test -f frontend/.dockerignore
+                            test -f frontend/dockerfile
+                            test -n "$GHCR_USERNAME"
+                            test -n "$GHCR_TOKEN"
+                            mkdir -p ci-reports
+
+                            export DOCKER_CONFIG
+                            DOCKER_CONFIG="$(mktemp -d /tmp/ghcr-auth.XXXXXX)"
+                            trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+
+                            registry_auth="$(printf '%s:%s' "$GHCR_USERNAME" "$GHCR_TOKEN" | base64 | tr -d '[:space:]')"
+                            printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$registry_auth" > "$DOCKER_CONFIG/config.json"
+                            unset registry_auth GHCR_USERNAME GHCR_TOKEN
+
+                            buildctl \
+                                --addr=tcp://buildkitd.jenkins-agents.svc.cluster.local:1234 \
+                                --tlscacert=/certs/ca.pem \
+                                --tlscert=/certs/cert.pem \
+                                --tlskey=/certs/key.pem \
+                                build \
+                                --progress=plain \
+                                --frontend=dockerfile.v0 \
+                                --local context=frontend \
+                                --local dockerfile=frontend \
+                                --opt filename=dockerfile \
+                                --opt platform=linux/amd64 \
+                                --opt "label:org.opencontainers.image.source=$SOURCE_REPOSITORY" \
+                                --opt "label:org.opencontainers.image.revision=$SOURCE_COMMIT" \
+                                --output "type=image,name=$FRONTEND_IMAGE:$SOURCE_COMMIT,push=true" \
+                                --metadata-file ci-reports/frontend-image-metadata.json
+                        '''
+                    }
+                }
+
+                container('python') {
+                    sh '''
+                        set -eu
+                        python - <<'PY'
+import json
+import os
+import re
+from pathlib import Path
+
+reports = Path("ci-reports")
+metadata = json.loads((reports / "frontend-image-metadata.json").read_text())
+digest = metadata.get("containerimage.digest", "")
+if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+    raise SystemExit("BuildKit did not return a valid image digest.")
+
+image = os.environ["FRONTEND_IMAGE"]
+commit = os.environ["SOURCE_COMMIT"]
+record = {
+    "repository": image,
+    "source_repository": os.environ["SOURCE_REPOSITORY"],
+    "source_commit": commit,
+    "platform": "linux/amd64",
+    "tag": f"{image}:{commit}",
+    "digest": digest,
+    "reference": f"{image}@{digest}",
+}
+(reports / "frontend-image.json").write_text(json.dumps(record, indent=2) + chr(10))
+print("Published tag: " + record["tag"])
+print("Published digest: " + record["reference"])
+print("PASS: Frontend image published to GHCR.")
+PY
+                    '''
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts(
+                        artifacts: 'ci-reports/frontend-image-metadata.json,ci-reports/frontend-image.json',
                         allowEmptyArchive: true,
                         fingerprint: true
                     )
