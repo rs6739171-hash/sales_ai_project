@@ -148,6 +148,8 @@ activemq-data/
 
 # SageMath parsed files
 *.sage.py
+backend/test-results/
+backend/.ci-venv/
 
 # Environments
 .env
