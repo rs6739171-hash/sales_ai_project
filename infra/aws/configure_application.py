@@ -10,9 +10,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-COMMIT = "4dfe4ff075d382c7444ef5b69bdda6ec984afa59"
-BACKEND = "ghcr.io/rs6739171-hash/sales-ai-backend@sha256:eb161e26a8f83997c5ea1db8bfa1151cf07163cb10f84593bede16eaaa47736c"
-FRONTEND = "ghcr.io/rs6739171-hash/sales-ai-frontend@sha256:77623403dcfa2b6a25c12ed2f3ea44db01184407691982f199b29473e0eaad79"
+COMMIT = "f363ace672a60b4d77a66f43971aa49f010b08f1"
+BACKEND = "ghcr.io/rs6739171-hash/sales-ai-backend@sha256:2865d36d1f5de1cdeffeb58ef8aa9e19296fa8e8a0b7869dfae1095f78eac22b"
+FRONTEND = "ghcr.io/rs6739171-hash/sales-ai-frontend@sha256:ab8006d0a962019b1eb11e0a3102d3f76dbdefcd4f8c797cd7715ad4973ee0d2"
 # Official Ollama 0.40.9, linux/amd64 manifest verified against Docker Hub.
 OLLAMA = "docker.io/ollama/ollama@sha256:1914dade358389ce67f527f8d54914f0872fdafdc7a95980096ad0ff6a381196"
 
