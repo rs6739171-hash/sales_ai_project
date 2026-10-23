@@ -48,7 +48,7 @@ resource "kubernetes_deployment_v1" "web" {
     namespace = kubernetes_namespace_v1.application.metadata[0].name
     labels    = local.common_labels
     annotations = {
-      "sales-ai/source-commit" = "f363ace672a60b4d77a66f43971aa49f010b08f1"
+      "sales-ai/source-commit" = "407d1db46eedb7373997d470542a42c3b5483eb9"
     }
   }
   spec {
