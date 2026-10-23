@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+
+metadata:
+  name: sales-ai-backend-config
+  namespace: sales-ai
+
+data:
+  OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
