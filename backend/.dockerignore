@@ -1,0 +1,28 @@
+# Local environment variables
+**/.env
+**/.env.*
+
+# Python environments and caches
+**/.venv
+**/venv
+**/.ci-venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Development tests and reports
+tests
+requirements-dev.txt
+**/test-results
+**/.coverage
+**/htmlcov
+
+# Git metadata, certificates and logs
+**/.git
+**/.certs
+**/*.pem
+**/*.key
+**/*.log

@@ -1,0 +1,21 @@
+# Local environment variables
+**/.env
+**/.env.*
+
+# Dependencies are installed inside the build
+**/node_modules
+
+# Generated outputs and reports
+dist
+coverage
+test-results
+frontend-dist.tar.gz
+frontend-dist.tar.gz.sha256
+**/*.tsbuildinfo
+
+# Git metadata, certificates and logs
+**/.git
+**/.certs
+**/*.pem
+**/*.key
+**/*.log
