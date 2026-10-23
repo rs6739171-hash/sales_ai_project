@@ -196,9 +196,14 @@ spec:
 
     options {
         disableConcurrentBuilds()
-        timeout(time: 30, unit: 'MINUTES')
+        timeout(time: 45, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '10'))
         skipDefaultCheckout(true)
+    }
+
+    environment {
+        BACKEND_IMAGE = 'ghcr.io/rs6739171-hash/sales-ai-backend'
+        SOURCE_REPOSITORY = 'https://github.com/rs6739171-hash/sales_ai_project'
     }
 
     stages {
@@ -370,13 +375,11 @@ spec:
             }
         }
 
-        stage('Archive build outputs') {
-            steps {
-                archiveArtifacts(
-                    artifacts: 'ci-reports/buildkit-workers.txt,source-commit.txt,source-files.txt,frontend/frontend-dist.tar.gz,frontend/frontend-dist.tar.gz.sha256,backend/test-results/backend-packages.txt',
-                    fingerprint: true
-                )
+
+        stage('Build and publish backend image') {
+            options {
+                timeout(time: 20, unit: 'MINUTES')
             }
-        }
-    }
-}
+            steps {
+                container('buildctl') {
+                    wi
