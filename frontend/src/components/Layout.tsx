@@ -14,6 +14,14 @@ export default function Layout() {
   const query = demo ? '?demo=1' : ''
   const links = [{ path: '/', title: 'Overview', icon: LayoutDashboard }, { path: '/analytics', title: 'AI analyst', icon: Sparkles }, { path: '/pipeline', title: 'Data pipeline', icon: Workflow }]
   return <div className="app-shell">
+    <div className="glossy-ambient-background" aria-hidden="true">
+      <div className="ambient-orb orb-emerald"/>
+      <div className="ambient-orb orb-violet"/>
+      <div className="ambient-orb orb-cyan"/>
+      <div className="ambient-orb orb-amber"/>
+      <div className="ambient-orb orb-rose"/>
+      <div className="ambient-glass-mesh"/>
+    </div>
     <a href="#main-content" className="skip-link">Skip to content</a>
     {menu ? <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setMenu(false)}/> : null}
     <aside className={`sidebar ${menu ? 'sidebar-open' : ''}`}>
