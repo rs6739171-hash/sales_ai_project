@@ -1,0 +1,58 @@
+Sales AI EKS platform controllers
+Prerequisite: foundation apply completed and kubectl can access EKS using the SDK
+exec helper. Extract this package into the existing project root.
+Run from Windows CMD with the project's Python environment active:
+python infra\aws\configure_platform.py
+terraform -chdir=infra/aws/platform init -backend-config=backend.hcl
+terraform -chdir=infra/aws/platform validate
+terraform -chdir=infra/aws/platform plan -out=platform.tfplan
+Review the plan, then: terraform -chdir=infra/aws/platform apply platform.tfplan
+This is a new Terraform root/state key: platform/terraform.tfstate.
+It reads the existing foundation state without taking ownership of that infrastructure.
+The generated backend.hcl and terraform.tfvars are ignored by the parent .gitignore.
+Helm's CLI is not required: Terraform's Helm provider installs the charts.
+Components:
+AWS Load Balancer Controller chart 3.6.1, two replicas, dedicated IRSA role.
+Cluster Autoscaler chart 9.59.0 with image v1.36.0, one active controller,
+dedicated IRSA role restricted to this cluster's tagged Auto Scaling groups.
+Metrics Server installed as an EKS community add-on using AWS API calls from Terraform.
+Explicit gp3 StorageClass using EBS CSI, encryption, expansion and delayed volume binding.
+This deployment uses Ingress for the application's load balancer. Gateway API
+features are explicitly disabled, so Gateway API CRDs are not needed for this step.
+The load balancer itself is created when the application Ingress is installed.
+Cluster Autoscaler is configured for the foundation's two node groups, each with
+minimum one and maximum two workers. The controller does not increase node count
+merely because traffic rises: application HPA creates more Pods and insufficient
+requested capacity can then trigger node creation.
+Application HPA resources are added with the application, not in this package.
+The scale-down delays are ten minutes to reduce churn.
+The gp3 class is not made the global default. Application model-cache claims will
+request it explicitly. Deleting a claim using this class deletes its backing EBS
+volume. The application stage must apply the intended claim lifecycle.
+Verification from the project root:
+kubectl --kubeconfig=infra/aws/eks-kubeconfig.yaml --context=eks-sales-ai -n kube-system get deployments aws-load-balancer-controller cluster-autoscaler metrics-server
+kubectl --kubeconfig=infra/aws/eks-kubeconfig.yaml --context=eks-sales-ai top nodes
+kubectl --kubeconfig=infra/aws/eks-kubeconfig.yaml --context=eks-sales-ai -n kube-system logs deployment/cluster-autoscaler --tail=30
+kubectl --kubeconfig=infra/aws/eks-kubeconfig.yaml --context=eks-sales-ai get storageclass gp3
+Metrics may need a minute after startup. Share an error if metrics remain unavailable
+or controller logs show AccessDenied, WebIdentityErr or failed AWS API discovery.
+No static AWS credentials are mounted into these controller Pods.
+Validation performed during preparation:
+Terraform native formatting/parsing.
+Helm chart archives checked against the official repository index digests.
+Both charts rendered for Kubernetes 1.36, with image versions, deployment and
+ServiceAccount names, IAM annotations and selected controller flags checked.
+Backend/auth-path generation exercised with mock Terraform outputs.
+Provider schema validation and live installation must run on the user's machine.
+The preparation environment blocks the local socket required by provider RPC.
+No live AWS resources were created during preparation.
+Policy attribution:
+platform/policies/load-balancer-controller.json is from the upstream AWS Load
+Balancer Controller v3.6.1, under Apache License 2.0 (copy in policies/LICENSE):
+https://github.com/kubernetes-sigs/aws-load-balancer-controller/blob/v3.6.1/docs/install/iam_policy.json
+Chart sources:
+https://aws.github.io/eks-charts
+https://kubernetes.github.io/autoscaler
+AWS guidance:
+https://docs.aws.amazon.com/eks/latest/best-practices/cas.html
+https://docs.aws.amazon.com/eks/latest/userguide/metrics-server.html

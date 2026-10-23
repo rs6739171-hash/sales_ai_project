@@ -147,9 +147,10 @@ def _settings() -> LLMSettings:
     return LLMSettings(base_url, model, *values)
 
 
-@lru_cache(maxsize=1)
-def get_client() -> ChatOllama:
+@lru_cache(maxsize=8)
+def get_client(timeout_seconds: Optional[int] = None) -> ChatOllama:
     settings = _settings()
+    timeout = min(settings.timeout, timeout_seconds) if timeout_seconds is not None else settings.timeout
     return _LocalChatOllama(
         base_url=settings.base_url,
         model=settings.model,
@@ -158,7 +159,7 @@ def get_client() -> ChatOllama:
         num_ctx=settings.num_ctx,
         num_predict=settings.num_predict,
         keep_alive="5m",
-        client_kwargs={"timeout": httpx.Timeout(settings.timeout, connect=5.0)},
+        client_kwargs={"timeout": httpx.Timeout(timeout, connect=min(5.0, timeout))},
     )
 
 
@@ -189,6 +190,8 @@ def _call_chat_native(
     tools: Optional[list[dict[str, Any]]] = None,
     json_mode: bool = False,
     response_schema: Optional[dict[str, Any]] = None,
+    max_output_tokens: Optional[int] = None,
+    deadline: Optional[float] = None,
 ) -> AIMessage:
     """Return native LangChain tool calls or a final text/JSON response.
 
@@ -202,6 +205,17 @@ def _call_chat_native(
         raise ValueError("Use separate requests for tool selection and final JSON.")
     if response_schema is not None and not json_mode:
         raise ValueError("response_schema requires json_mode=True.")
+    if max_output_tokens is not None and max_output_tokens < 1:
+        raise ValueError("max_output_tokens must be positive.")
+    # Chat calls share a deadline across tool selection and narration. A
+    # bounded chat call must not start automatic retries after its time is up.
+    timeout_seconds = None
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            raise LLMServiceError("The chat inference time budget was exhausted. Please try again.")
+        timeout_seconds = max(1, min(settings.timeout, int(remaining)))
+    retry_limit = 0 if deadline is not None else settings.max_retries
     # Legacy assistant tool-call dumps may omit content when it is None.
     normalized = [
         {**message, "content": message.get("content") or ""}
@@ -209,10 +223,25 @@ def _call_chat_native(
         for message in messages
     ]
     request_messages = convert_to_messages(normalized)
-    model = get_client()
+    # Qwen3 also understands the documented prompt-level non-thinking switch.
+    # Do not alter stored conversation history or replayed tool messages.
+    if settings.model.lower().startswith("qwen3"):
+        instruction = "Give the final answer directly. Do not include your analysis. /no_think"
+        if isinstance(request_messages[0], SystemMessage):
+            original = request_messages[0]
+            request_messages[0] = SystemMessage(content=f"{original.content}\n\n{instruction}")
+        else:
+            request_messages.insert(0, SystemMessage(content=instruction))
+    model = get_client(timeout_seconds) if timeout_seconds is not None else get_client()
     runnable = model.bind_tools(tools) if tools else model
     # Return complete responses to FastAPI; do not expose reasoning or partial JSON.
-    runnable = runnable.bind(stream=False)
+    runnable = runnable.bind(stream=False, reasoning=False)
+    if max_output_tokens is not None:
+        runnable = runnable.bind(options={
+            "num_ctx": settings.num_ctx,
+            "num_predict": min(settings.num_predict, max_output_tokens),
+            "temperature": 0,
+        })
     if json_mode:
         instruction = (
             "Return only the requested JSON object. Use the exact field names and "
@@ -228,24 +257,25 @@ def _call_chat_native(
             request_messages.insert(0, SystemMessage(content=instruction))
         runnable = runnable.bind(format=response_schema if response_schema is not None else "json")
 
-    for attempt in range(settings.max_retries + 1):
+    started = time.monotonic()
+    for attempt in range(retry_limit + 1):
         try:
             response = runnable.invoke(request_messages)
             break
         except ResponseError as exc:
             status = exc.status_code or 500
             transient = status in {408, 429} or 500 <= status < 600
-            if not transient or attempt == settings.max_retries:
+            if not transient or attempt == retry_limit:
                 logger.error("Ollama request failed: server status %s", status)
                 raise _server_error(status) from exc
         except httpx.TimeoutException as exc:
-            if attempt == settings.max_retries:
+            if attempt == retry_limit:
                 raise LLMServiceError(
-                    "Ollama generation timed out. Check model loading and GPU allocation "
-                    "with ollama ps; the first request can take longer."
+                    "Ollama did not finish within the inference time budget. "
+                    "The server may be busy or inference may be too slow for the available compute."
                 ) from exc
         except (ConnectionError, httpx.RequestError) as exc:
-            if attempt == settings.max_retries:
+            if attempt == retry_limit:
                 raise LLMServiceError(
                     "Cannot connect to Ollama. Start the Ollama application and "
                     "check OLLAMA_BASE_URL. The default port is 11434."
@@ -255,18 +285,30 @@ def _call_chat_native(
         except ValidationError as exc:
             raise LLMResponseError("Ollama returned a malformed response or tool arguments. Please retry.") from exc
         delay = 2 ** attempt + random.uniform(0, 0.5)
-        logger.warning("Retrying Ollama in %.1fs (%d/%d)", delay, attempt + 1, settings.max_retries)
+        logger.warning("Retrying Ollama in %.1fs (%d/%d)", delay, attempt + 1, retry_limit)
         time.sleep(delay)
 
     if not isinstance(response, AIMessage):
         raise LLMResponseError("Ollama returned an unexpected message type.")
+    logger.info(
+        "Ollama completed: elapsed=%.1fs tools_enabled=%s json_mode=%s "
+        "prompt_tokens=%s output_tokens=%s done_reason=%s",
+        time.monotonic() - started, bool(tools), json_mode,
+        response.response_metadata.get("prompt_eval_count"),
+        response.response_metadata.get("eval_count"),
+        response.response_metadata.get("done_reason"),
+    )
     if response.invalid_tool_calls:
         raise LLMResponseError("Ollama returned malformed tool arguments. Please retry.")
     reason = response.response_metadata.get("done_reason")
     if reason not in {None, "stop", "tool_calls"}:
-        raise LLMResponseError(
-            f"Ollama response stopped before completion ({reason}). "
+        hint = (
+            "Try a shorter question; the model exceeded this chat phase's output budget."
+            if max_output_tokens is not None else
             "For length errors, increase OLLAMA_NUM_PREDICT within the context budget."
+        )
+        raise LLMResponseError(
+            f"Ollama response stopped before completion ({reason}). {hint}"
         )
     if not response.text and not response.tool_calls:
         raise LLMResponseError("Ollama returned no text or tool calls.")
@@ -342,3 +384,4 @@ if __name__ == "__main__":
     if not isinstance(parsed, dict) or not isinstance(parsed.get("message"), str):
         raise LLMResponseError("Ollama did not return the expected greeting JSON.")
     print(json.dumps(parsed, indent=2, ensure_ascii=False))
+

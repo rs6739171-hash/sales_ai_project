@@ -13,12 +13,18 @@ those functions actually returned.
 import json
 import logging
 import re
+import time
 from typing import Any, Optional
 
 from langchain_core.messages import BaseMessage, ToolMessage
 
 from src.data import analytics
-from src.genai.llm_client import _call_chat_native as call_chat
+from src.genai.llm_client import (
+    CHAT_ANSWER_SCHEMA,
+    LLMResponseError,
+    LLMServiceError,
+    _call_chat_native as call_chat,
+)
 
 logger = logging.getLogger("sales_forecasting_api.chatbot")
 
@@ -29,6 +35,7 @@ For greetings, general questions, explanations, and casual conversation:
 - Answer naturally using your general knowledge.
 - Do not call analytics tools unless the question requires sales data.
 - Keep answers concise unless the user requests more detail.
+- Prefer two or three short sentences; omit analysis and internal deliberation.
 
 For questions about this application's actual sales, products, stores,
 revenue, rankings, or forecasts:
@@ -43,8 +50,36 @@ Clearly distinguish general advice from findings based on actual data.
 Always respond with one valid JSON object in this exact shape:
 {"answer": "Your response, optionally using simple Markdown"}
 
-Do not include any text outside that JSON object.
+When requesting analytics tools, emit the native tool calls instead of a JSON answer.
+For a final answer, do not include any text outside the JSON object.
 """
+
+_GREETING = re.compile(
+    r"(?:hi|hello|hey|hii|hiya|namaste|good\s+(?:morning|afternoon|evening))\s*[!.?]*",
+    re.IGNORECASE,
+)
+
+
+def _greeting_response(message: str, deadline: float) -> dict[str, Any]:
+    """A genuine LLM reply with no tool descriptions or redundant repair call."""
+    response = call_chat(
+        [
+            {"role": "system", "content": (
+                'You are SalesIQ, a friendly sales analytics assistant. '
+                'Greet the user in one short sentence and offer to help. '
+                'Return only JSON: {"answer": "..."}. Do not invent business data.'
+            )},
+            {"role": "user", "content": message},
+        ],
+        json_mode=True,
+        response_schema=CHAT_ANSWER_SCHEMA,
+        max_output_tokens=96,
+        deadline=deadline,
+    )
+    answer = _parse_answer(response.text)
+    if answer is None:
+        raise LLMResponseError("The model did not return a valid chat answer. Please try again.")
+    return {"answer": answer, "data": {}, "functions_used": []}
 
 
 def _build_system_prompt(store_id: Optional[str], store_name: Optional[str]) -> str:
@@ -290,12 +325,18 @@ def run_chat(
     store_id: Optional[str] = None,
     store_name: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Answer a business question using analytics tools and Mistral through LangChain.
+    """Answer using analytics tools and Ollama through LangChain.
 
     Returns the existing answer/data/functions_used API shape. Tool selection
     and final JSON generation are separate requests. Provider failures propagate
     to FastAPI; malformed final JSON falls back to the actual tool results.
     """
+    # Keep model calls within the frontend's 240-second request timeout.
+    # This bounds inference waits; external SQL calls have their own timing.
+    deadline = time.monotonic() + 180
+    if _GREETING.fullmatch(message.strip()):
+        return _greeting_response(message, deadline)
+
     messages: list[BaseMessage | dict[str, Any]] = [
         {"role": "system", "content": _build_system_prompt(store_id, store_name)}
     ]
@@ -304,7 +345,9 @@ def run_chat(
             messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": message})
 
-    assistant_message = call_chat(messages, tools=TOOLS)
+    assistant_message = call_chat(
+        messages, tools=TOOLS, max_output_tokens=192, deadline=deadline,
+    )
     tool_results: dict[str, Any] = {}
     if assistant_message.tool_calls:
         # Replay the native LangChain assistant message before tool results.
@@ -331,7 +374,18 @@ def run_chat(
 
     for attempt in range(2):
         # No tools in the final JSON request: execution is already complete.
-        final_message = call_chat(messages, json_mode=True)
+        try:
+            final_message = call_chat(
+                messages, json_mode=True, response_schema=CHAT_ANSWER_SCHEMA,
+                max_output_tokens=256, deadline=deadline,
+            )
+        except LLMServiceError:
+            if not tool_results:
+                raise
+            # Actual SQL results remain useful when model narration is too slow.
+            # Reuse the existing factual fallback; never invent a replacement.
+            logger.warning("Chat narration failed; returning the retrieved tool results")
+            break
         if final_message.tool_calls:
             logger.warning("Unexpected tool request during final answer generation")
             break
@@ -480,3 +534,4 @@ def run_quick_action(action: str, params: Optional[dict[str, Any]] = None) -> di
     fetch, formatter = entry
     result = fetch(params or {})
     return {"answer": formatter(result), "data": {action: result}, "functions_used": [action]}
+
