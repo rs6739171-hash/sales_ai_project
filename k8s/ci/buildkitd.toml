@@ -1,0 +1,21 @@
+root = "/var/lib/buildkit"
+
+[grpc]
+    - addresses: ["172.19.0.6"]
+
+  [grpc.tls]
+    ca = "/etc/buildkit/tls/ca.pem"
+    cert = "/etc/buildkit/tls/cert.pem"
+    key = "/etc/buildkit/tls/key.pem"
+
+[worker.oci]
+  enabled = true
+  max-parallelism = 1
+  gc = true
+  reservedSpace = "2GB"
+  maxUsedSpace = "8GB"
+  minFreeSpace = "4GB"
+
+[worker.containerd]
+  enabled = false
+

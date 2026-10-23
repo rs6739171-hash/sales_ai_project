@@ -146,9 +146,50 @@ spec:
         - name: temporary-files
           mountPath: /tmp
 
+
+    - name: buildctl
+      image: moby/buildkit:v0.34.1
+      imagePullPolicy: IfNotPresent
+      workingDir: /home/jenkins/agent
+
+      command:
+        - sleep
+      args:
+        - "7d"
+
+      env:
+        - name: HOME
+          value: "/tmp"
+
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "250m"
+          memory: "256Mi"
+
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+
+      volumeMounts:
+        - name: temporary-files
+          mountPath: /tmp
+        - name: buildkit-client-tls
+          mountPath: /certs
+          readOnly: true
+
   volumes:
     - name: temporary-files
       emptyDir: {}
+    - name: buildkit-client-tls
+      secret:
+        secretName: buildkit-client-tls
+        defaultMode: 0440
 '''
         }
     }
@@ -197,6 +238,38 @@ spec:
             }
         }
 
+
+
+        stage('Verify BuildKit connection') {
+            options {
+                timeout(time: 2, unit: 'MINUTES')
+            }
+            steps {
+                container('buildctl') {
+                    sh '''
+                        set -eu
+
+                        buildctl --version
+                        test -r /certs/ca.pem
+                        test -r /certs/cert.pem
+                        test -r /certs/key.pem
+                        mkdir -p ci-reports
+
+                        buildctl \
+                            --addr=tcp://buildkitd.jenkins-agents.svc.cluster.local:1234 \
+                            --tlscacert=/certs/ca.pem \
+                            --tlscert=/certs/cert.pem \
+                            --tlskey=/certs/key.pem \
+                            debug workers > ci-reports/buildkit-workers.txt
+
+                        test -s ci-reports/buildkit-workers.txt
+                        cat ci-reports/buildkit-workers.txt
+
+                        echo "PASS: Jenkins agent connected to BuildKit using mutual TLS."
+                    '''
+                }
+            }
+        }
 
         stage('Install backend dependencies') {
             steps {
@@ -300,7 +373,7 @@ spec:
         stage('Archive build outputs') {
             steps {
                 archiveArtifacts(
-                    artifacts: 'source-commit.txt,source-files.txt,frontend/frontend-dist.tar.gz,frontend/frontend-dist.tar.gz.sha256,backend/test-results/backend-packages.txt',
+                    artifacts: 'ci-reports/buildkit-workers.txt,source-commit.txt,source-files.txt,frontend/frontend-dist.tar.gz,frontend/frontend-dist.tar.gz.sha256,backend/test-results/backend-packages.txt',
                     fingerprint: true
                 )
             }

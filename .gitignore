@@ -150,6 +150,7 @@ activemq-data/
 *.sage.py
 backend/test-results/
 backend/.ci-venv/
+/infra/buildkit/.certs/
 
 # Environments
 .env

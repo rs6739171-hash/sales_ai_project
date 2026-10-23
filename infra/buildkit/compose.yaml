@@ -1,0 +1,88 @@
+name: sales-ai-build
+
+services:
+  buildkit:
+    image: moby/buildkit:v0.34.1
+    container_name: sales-ai-buildkit
+    privileged: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 1024
+    command:
+      - --config=/etc/buildkit/buildkitd.toml
+    volumes:
+      - type: volume
+        source: buildkit_state
+        target: /var/lib/buildkit
+      - type: bind
+        source: ./buildkitd.toml
+        target: /etc/buildkit/buildkitd.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.certs/daemon
+        target: /etc/buildkit/tls
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - buildctl
+        - --addr=unix:///run/buildkit/buildkitd.sock
+        - debug
+        - workers
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - kind_network
+
+  buildkit-check:
+    image: moby/buildkit:v0.34.1
+    profiles:
+      - tools
+    entrypoint:
+      - buildctl
+    command:
+      - --addr=tcp://sales-ai-buildkit:1234
+      - --tlscacert=/certs/ca.pem
+      - --tlscert=/certs/cert.pem
+      - --tlskey=/certs/key.pem
+      - debug
+      - workers
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ./.certs/client
+        target: /certs
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      buildkit:
+        condition: service_healthy
+    networks:
+      - kind_network
+
+volumes:
+  buildkit_state:
+    name: sales-ai-buildkit-state
+
+networks:
+  kind_network:
+    external: true
+    name: kind
