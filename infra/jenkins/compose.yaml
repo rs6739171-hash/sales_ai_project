@@ -1,0 +1,43 @@
+name: sales-ai-ci
+
+services:
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: sales_ai_jenkins:local-v1
+    container_name: sales-ai-jenkins
+
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+    ports:
+      - "127.0.0.1:8082:8080"
+
+    environment:
+      JAVA_OPTS: "-Xms256m -Xmx768m -Djava.awt.headless=true"
+
+    mem_limit: 1536m
+    cpus: 1.5
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    volumes:
+      - jenkins_home:/var/jenkins_home
+
+    networks:
+      - kind_network
+
+volumes:
+  jenkins_home:
+    name: sales-ai-jenkins-home
+
+networks:
+  kind_network:
+    external: true
+    name: kind
